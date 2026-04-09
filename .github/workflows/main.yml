@@ -1,0 +1,198 @@
+# .github/workflows/calm-integration.yml
+
+name: SAP Cloud ALM Integration
+
+on:
+  pull_request:
+    types: [opened, synchronize, closed]
+    branches:
+      - main
+      - develop
+
+env:
+  CALM_TOKEN_URL: ${{ secrets.CALM_TOKEN_URL }}
+  CALM_CLIENT_ID: ${{ secrets.CALM_CLIENT_ID }}
+  CALM_CLIENT_SECRET: ${{ secrets.CALM_CLIENT_SECRET }}
+  CALM_API_BASE_URL: ${{ secrets.CALM_API_BASE_URL }}
+  CALM_PROJECT_ID: ${{ secrets.CALM_PROJECT_ID }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Notify SAP Cloud ALM when PR is opened
+  # ─────────────────────────────────────────────
+  calm-pr-opened:
+    name: Create Feature in SAP Cloud ALM
+    runs-on: ubuntu-latest
+    if: github.event.action == 'opened'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get OAuth Token from SAP BTP
+        id: get-token
+        run: |
+          TOKEN=$(curl -s -X POST "$CALM_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=$CALM_CLIENT_ID" \
+            -d "client_secret=$CALM_CLIENT_SECRET" \
+            | jq -r '.access_token')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Create Feature in SAP Cloud ALM
+        id: create-feature
+        run: |
+          RESPONSE=$(curl -s -X POST "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "title": "${{ github.event.pull_request.title }}",
+              "description": "GitHub PR #${{ github.event.pull_request.number }}\n${{ github.event.pull_request.html_url }}\n\n${{ github.event.pull_request.body }}",
+              "projectId": "${{ env.CALM_PROJECT_ID }}",
+              "status": "IN_DEVELOPMENT",
+              "externalId": "PR-${{ github.event.pull_request.number }}",
+              "externalUrl": "${{ github.event.pull_request.html_url }}"
+            }')
+
+          FEATURE_ID=$(echo $RESPONSE | jq -r '.id')
+          echo "feature_id=$FEATURE_ID" >> $GITHUB_OUTPUT
+          echo "Created SAP Cloud ALM Feature: $FEATURE_ID"
+
+      - name: Comment Feature ID on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🔗 **SAP Cloud ALM Feature Created**\n\nFeature ID: \`${{ steps.create-feature.outputs.feature_id }}\`\n\n[View in SAP Cloud ALM](${{ env.CALM_API_BASE_URL }})`
+            })
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Update Feature status when PR is updated
+  # ─────────────────────────────────────────────
+  calm-pr-updated:
+    name: Update Feature Status in SAP Cloud ALM
+    runs-on: ubuntu-latest
+    if: github.event.action == 'synchronize'
+
+    steps:
+      - name: Get OAuth Token
+        id: get-token
+        run: |
+          TOKEN=$(curl -s -X POST "$CALM_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=$CALM_CLIENT_ID" \
+            -d "client_secret=$CALM_CLIENT_SECRET" \
+            | jq -r '.access_token')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Find Existing Feature by External ID
+        id: find-feature
+        run: |
+          RESPONSE=$(curl -s -X GET \
+            "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features?externalId=PR-${{ github.event.pull_request.number }}" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}")
+
+          FEATURE_ID=$(echo $RESPONSE | jq -r '.value[0].id // empty')
+          echo "feature_id=$FEATURE_ID" >> $GITHUB_OUTPUT
+
+      - name: Update Feature Status to In Testing
+        if: steps.find-feature.outputs.feature_id != ''
+        run: |
+          curl -s -X PATCH \
+            "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features/${{ steps.find-feature.outputs.feature_id }}" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "IN_TESTING",
+              "description": "Updated from GitHub PR #${{ github.event.pull_request.number }} - new commits pushed"
+            }'
+          echo "Updated Feature ${{ steps.find-feature.outputs.feature_id }} to IN_TESTING"
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Close Feature when PR is merged
+  # ─────────────────────────────────────────────
+  calm-pr-merged:
+    name: Close Feature in SAP Cloud ALM on Merge
+    runs-on: ubuntu-latest
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+
+    steps:
+      - name: Get OAuth Token
+        id: get-token
+        run: |
+          TOKEN=$(curl -s -X POST "$CALM_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=$CALM_CLIENT_ID" \
+            -d "client_secret=$CALM_CLIENT_SECRET" \
+            | jq -r '.access_token')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Find Feature by External ID
+        id: find-feature
+        run: |
+          RESPONSE=$(curl -s -X GET \
+            "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features?externalId=PR-${{ github.event.pull_request.number }}" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}")
+
+          FEATURE_ID=$(echo $RESPONSE | jq -r '.value[0].id // empty')
+          echo "feature_id=$FEATURE_ID" >> $GITHUB_OUTPUT
+
+      - name: Mark Feature as Successfully Tested / Deployed
+        if: steps.find-feature.outputs.feature_id != ''
+        run: |
+          curl -s -X PATCH \
+            "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features/${{ steps.find-feature.outputs.feature_id }}" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "SUCCESSFULLY_TESTED",
+              "description": "Merged to ${{ github.base_ref }} by ${{ github.actor }} on ${{ github.event.pull_request.merged_at }}"
+            }'
+          echo "Feature ${{ steps.find-feature.outputs.feature_id }} marked as SUCCESSFULLY_TESTED"
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Close Feature when PR is closed without merge
+  # ─────────────────────────────────────────────
+  calm-pr-closed:
+    name: Discard Feature in SAP Cloud ALM on PR Close
+    runs-on: ubuntu-latest
+    if: github.event.action == 'closed' && github.event.pull_request.merged == false
+
+    steps:
+      - name: Get OAuth Token
+        id: get-token
+        run: |
+          TOKEN=$(curl -s -X POST "$CALM_TOKEN_URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=$CALM_CLIENT_ID" \
+            -d "client_secret=$CALM_CLIENT_SECRET" \
+            | jq -r '.access_token')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Find and Discard Feature
+        run: |
+          RESPONSE=$(curl -s -X GET \
+            "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features?externalId=PR-${{ github.event.pull_request.number }}" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}")
+
+          FEATURE_ID=$(echo $RESPONSE | jq -r '.value[0].id // empty')
+
+          if [ -n "$FEATURE_ID" ]; then
+            curl -s -X PATCH \
+              "$CALM_API_BASE_URL/imp-cdm-feature-service/v1/features/$FEATURE_ID" \
+              -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              -d '{"status": "DISCARDED"}'
+            echo "Feature $FEATURE_ID marked as DISCARDED"
+          fi
